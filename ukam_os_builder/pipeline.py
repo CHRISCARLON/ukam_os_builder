@@ -20,6 +20,7 @@ from ukam_os_builder.os_builder.pipeline_factory import (
 )
 
 SourceType = Literal["ngd", "abp"]
+PipelineRunStep = Literal["all", "download", "extract", "split", "flatfile"]
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ def _definition_for_source(source: SourceType) -> PipelineDefinition:
 
 
 def run(
-    step: Literal["all", "download"],
+    step: PipelineRunStep,
     settings: Settings,
     force: bool = False,
     list_only: bool = False,
