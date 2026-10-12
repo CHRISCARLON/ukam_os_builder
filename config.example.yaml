@@ -1,9 +1,27 @@
 # NGD Pipeline Configuration
-# All paths are relative to this config file's directory unless absolute
+# Local paths are relative to this config file's directory unless absolute
 
 paths:
-  # Base working directory for all data
+  # Base location: local directory, s3://bucket/base or
+  # az://account.blob.core.windows.net/container/base
+  # Final files go to <base>/output; cloud bases keep processing local.
   work_dir: ./data
+  # Local downloads, intermediates and spill for a cloud base (default ./data)
+  # cache_dir: ./data
+  # Optional exact final location instead of <base>/output:
+  # overrides:
+  #   output_dir: s3://my-address-bucket/canonical/ngd
+
+# Optional AWS identity/encryption settings when the output path is S3.
+# Install ukam-os-builder[aws] or ukam-os-builder[azure].
+# output:
+#   aws:
+#     region: eu-west-2
+#     profile: development
+#     credential_chain: [sso]  # Run aws sso login first; omit profile/chain for IAM jobs.
+#     kms_key_id: arn:aws:kms:eu-west-2:123456789012:key/your-key-id
+# One writer per source/prefix; readers wait for _ukam_SOURCE_output.json.
+# --overwrite removes old source chunks and does not preserve last-good output on failure.
 
 # OS Data Hub download settings
 # Given a datapackage at: https://osdatahub.os.uk/data/downloads/data-packages/16331
@@ -59,11 +77,3 @@ processing:
   # Valid values: 1 (approved), 3 (alternative), 6 (provisional), 8 (historic)
   abp_excluded_logical_statuses:
     - 8
-
-# Optional (NGD only): write final output files to Azure Blob Storage instead of
-# output_dir. Requires: pip install "ukam-os-builder[azure]" (duckdb>=1.4.3).
-# Authenticates with the Azure credential chain (az login, managed identity, or
-# AZURE_CLIENT_ID/AZURE_TENANT_ID/AZURE_CLIENT_SECRET).
-# Doesn't work for all blob types yet (only az:// URIs are supported)
-# output_blob:
-#   uri: az://<account>.blob.core.windows.net/<container>/<prefix>
