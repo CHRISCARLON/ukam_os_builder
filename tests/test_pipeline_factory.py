@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from ukam_os_builder._exceptions import PipelineError
+from ukam_os_builder.api.settings import Settings
 from ukam_os_builder.os_builder.pipeline_factory import (
     PipelineDefinition,
     make_standard_step,
@@ -14,14 +13,7 @@ from ukam_os_builder.os_builder.pipeline_factory import (
 )
 
 
-def _settings(tmp_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(
-        config_path=tmp_path / "config.yaml",
-        paths=SimpleNamespace(work_dir=tmp_path),
-    )
-
-
-def test_run_pipeline_executes_declared_individual_step(tmp_path: Path) -> None:
+def test_run_pipeline_executes_declared_individual_step(temp_settings: Settings) -> None:
     calls: list[tuple[object, bool]] = []
 
     def run_split(settings: object, force: bool) -> None:
@@ -33,19 +25,17 @@ def test_run_pipeline_executes_declared_individual_step(tmp_path: Path) -> None:
         clean_patterns={},
         step_outputs={},
     )
-    settings = _settings(tmp_path)
-
     run_pipeline(
         definition=definition,
         step="split",
-        settings=settings,
+        settings=temp_settings,
         logger=logging.getLogger("test.pipeline_factory"),
     )
 
-    assert calls == [(settings, False)]
+    assert calls == [(temp_settings, False)]
 
 
-def test_run_pipeline_rejects_step_not_declared_by_pipeline(tmp_path: Path) -> None:
+def test_run_pipeline_rejects_step_not_declared_by_pipeline(temp_settings: Settings) -> None:
     definition = PipelineDefinition(
         dataset_name="ngd",
         steps=(make_standard_step("flatfile", lambda _settings, _force: None),),
@@ -57,6 +47,6 @@ def test_run_pipeline_rejects_step_not_declared_by_pipeline(tmp_path: Path) -> N
         run_pipeline(
             definition=definition,
             step="split",
-            settings=_settings(tmp_path),
+            settings=temp_settings,
             logger=logging.getLogger("test.pipeline_factory"),
         )

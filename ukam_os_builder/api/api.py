@@ -29,8 +29,9 @@ from ukam_os_builder.data_sources.ngd.ngd_exclusions import (
 )
 from ukam_os_builder.os_builder.os_hub import _get_manifest_path, format_size, get_package_version
 from ukam_os_builder.os_builder.output import build_writer
-from ukam_os_builder.pipeline import PipelineRunStep, supported_steps_for_source
+from ukam_os_builder.os_builder.pipeline_factory import PipelineRunStep
 from ukam_os_builder.pipeline import run as run_pipeline
+from ukam_os_builder.pipeline import supported_steps_for_source
 
 logger = logging.getLogger(__name__)
 
