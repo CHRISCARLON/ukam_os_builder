@@ -41,12 +41,11 @@ _NGD_PIPELINE = PipelineDefinition(
             "parquet/*.parquet",
             *COMMON_BLOAT_PATTERNS,
         ],
-        "output_dir": ["*.parquet"],
     },
     step_outputs={
         "download": [],
         "extract": ["extracted_dir"],
-        "flatfile": ["output_dir"],
+        "flatfile": [],
     },
 )
 
@@ -68,13 +67,12 @@ _ABP_PIPELINE = PipelineDefinition(
             "raw/*.parquet",
             *COMMON_BLOAT_PATTERNS,
         ],
-        "output_dir": ["*.parquet"],
     },
     step_outputs={
         "download": [],
         "extract": ["extracted_dir"],
         "split": ["parquet_dir"],
-        "flatfile": ["output_dir"],
+        "flatfile": [],
     },
 )
 

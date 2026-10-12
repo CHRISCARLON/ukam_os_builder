@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import duckdb
 import yaml
+
+from ..api.settings import resolve_paths
 
 SourceType = Literal["ngd", "abp"]
 
@@ -24,13 +27,17 @@ _DEFAULT_SELECT_COLUMNS = [
 
 
 def _resolve_path(base_dir: Path, path_str: str) -> Path:
+    if urlsplit(path_str).scheme in {"s3", "az"}:
+        raise ValueError(
+            "Inspection supports local output only; copy files locally and pass output_dir"
+        )
     path = Path(path_str)
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
 
 
-def _read_config_for_output(config_path: Path) -> tuple[Path, SourceType]:
+def _read_config_for_output(config_path: Path) -> tuple[Path | str, SourceType]:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Invalid config format: {config_path}")
@@ -43,10 +50,11 @@ def _read_config_for_output(config_path: Path) -> tuple[Path, SourceType]:
     if not isinstance(paths, dict):
         raise ValueError("paths must be a mapping in config")
 
-    work_dir_raw = str(paths.get("work_dir", "./data"))
-    output_dir_raw = str(paths.get("output_dir", Path(work_dir_raw) / "output"))
-
-    output_dir = _resolve_path(config_path.parent, output_dir_raw)
+    paths = dict(paths)
+    if "output_dir" in paths:
+        output_dir = paths.pop("output_dir")
+        paths["overrides"] = {"output_dir": output_dir, **(paths.get("overrides") or {})}
+    output_dir = resolve_paths({"paths": paths}, config_path.parent)["output_dir"]
     return output_dir, source_value  # type: ignore[return-value]
 
 
@@ -66,10 +74,13 @@ def _resolve_runtime_context(
 
     if output_dir is None or source is None:
         resolved_output_dir, resolved_source = _read_config_for_output(config_path)
-        output_dir_path = Path(output_dir).resolve() if output_dir else resolved_output_dir
+        output_dir_path = _resolve_path(
+            Path.cwd() if output_dir is not None else config_path.parent,
+            str(output_dir if output_dir is not None else resolved_output_dir),
+        )
         source_value = source or resolved_source
     else:
-        output_dir_path = Path(output_dir).resolve()
+        output_dir_path = _resolve_path(Path.cwd(), str(output_dir))
         source_value = source
 
     pattern = _pattern_for_source(source_value)

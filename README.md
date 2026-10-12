@@ -125,7 +125,7 @@ Most users only need one path setting:
 
 - `paths.work_dir` (default `./data`, relative to the config file directory)
 
-The tool derives all other directories automatically under `work_dir`.
+For a local base, all directories are derived under `work_dir`. For an S3 or Azure base, only final address-matcher files go to `<base>/output`; downloads, intermediates and spill stay in local `paths.cache_dir` (default `./data`).
 
 </details>
 
@@ -181,12 +181,34 @@ ABP continues to materialise CSV files because its `split` stage consumes raw CS
 
 ## Output
 
-Final outputs are parquet files in `paths.output_dir`:
+Final outputs are parquet files under `<paths.work_dir>/output`, unless `paths.overrides.output_dir` selects an exact destination:
 
 - Single chunk: `ngd_for_uk_address_matcher.chunk_001_of_001.parquet`
 - Multi-chunk: `ngd_for_uk_address_matcher.chunk_001_of_00N.parquet`, `...chunk_00N_of_00N.parquet`
 
 Chunking reduces memory use by processing UPRNs in batches. The default is `num_chunks: 10`, and the union of all chunk files equals the single-chunk output. Increase `num_chunks` for very large canonical files or machines with limited RAM; set it to `1` only when a single output file is explicitly required.
+
+### Cloud output (NGD and ABP)
+
+Use the AWS extra for S3 or the Azure extra for Azure, and authenticate with your provider credentials:
+
+```bash
+uvx --from "ukam-os-builder[aws]" ukam-os-build --config config.yaml
+uvx --from "ukam-os-builder[azure]" ukam-os-build --config config.yaml
+```
+
+```yaml
+paths:
+  work_dir: ./data
+  overrides:
+    output_dir: s3://bucket/prefix  # Or az://account.blob.core.windows.net/container/prefix
+```
+
+`--output-dir` accepts the same paths. Alternatively, set `paths.work_dir` to a cloud base to write to `<base>/output`; processing remains local in `paths.cache_dir` (default `./data`).
+
+Cloud output needs list/read/write/delete permissions and one writer per source/prefix. Readers must wait for `_ukam_SOURCE_output.json`; overwrites are not atomic and do not preserve previous output on failure.
+
+Add further cloud hosts by implementing a `Writer` and registering its scheme in `WRITERS` in [ukam_os_builder/os_builder/output.py](ukam_os_builder/os_builder/output.py).
 
 ## Schemas
 
@@ -375,12 +397,14 @@ processing:
 
 `parquet_compression` and `parquet_compression_level` apply to intermediate and final Parquet files. Set `sort_output_by_postcode: true` to sort each final NGD chunk by postcode and `unique_id`; this can reduce file size but requires additional sorting work.
 
-By default, the tool creates these directories under `paths.work_dir`:
+With a local base, the tool creates these directories under `paths.work_dir`:
 
 - downloads: `<work_dir>/downloads`
 - extracted: `<work_dir>/extracted`
 - parquet: `<work_dir>/parquet`
 - output: `<work_dir>/output`
+
+With an S3 or Azure base, only output uses that base. Downloads, extracted files and intermediate Parquet use `paths.cache_dir` (default `./data`). Downloads, intermediates, cache and schema paths must be local.
 
 <details>
 <summary>Advanced: override default directories</summary>
@@ -399,7 +423,7 @@ paths:
     output_dir: ./output
 ```
 
-Override keys replace derived defaults. Relative paths are resolved relative to the directory containing `config.yaml`.
+Override keys replace derived defaults. Relative local paths are resolved relative to the directory containing `config.yaml`. `output_dir` also accepts S3 and Azure paths; the other overrides remain local.
 
 </details>
 

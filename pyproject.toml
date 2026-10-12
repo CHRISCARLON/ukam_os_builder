@@ -35,6 +35,8 @@ ukam-ngd-build = "ukam_os_builder.cli:main"
 ukam-ngd-setup = "ukam_os_builder.setup_wizard:main"
 
 [project.optional-dependencies]
+aws = ["duckdb>=1.4.3", "s3fs>=2024.6.0"]
+azure = ["duckdb>=1.4.3", "adlfs>=2024.4.1"]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.8.0",
@@ -58,6 +60,7 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["cloud: opt-in real-provider tests using a dedicated test prefix"]
 
 [dependency-groups]
 dev = [

@@ -9,7 +9,14 @@ import duckdb
 import requests
 import yaml
 
-from ukam_os_builder.api.settings import Settings, SettingsError, load_settings
+from ukam_os_builder.api.settings import (
+    OutputSettings,
+    PathSettings,
+    Settings,
+    SettingsError,
+    load_settings,
+    resolve_paths,
+)
 from ukam_os_builder.data_sources.abp.abp_exclusions import (
     DEFAULT_ABP_EXCLUDED_LOGICAL_STATUSES,
     format_valid_abp_excluded_logical_statuses,
@@ -21,6 +28,7 @@ from ukam_os_builder.data_sources.ngd.ngd_exclusions import (
     parse_ngd_excluded_stems,
 )
 from ukam_os_builder.os_builder.os_hub import _get_manifest_path, format_size, get_package_version
+from ukam_os_builder.os_builder.output import build_writer
 from ukam_os_builder.pipeline import run as run_pipeline
 from ukam_os_builder.pipeline import supported_steps_for_source
 
@@ -57,9 +65,12 @@ def _default_config() -> dict[str, object]:
 DEFAULT_CONFIG: dict[str, object] = _default_config()
 
 
-def _collect_output_metadata(output_dir: Path) -> tuple[int, int, int]:
+def _collect_output_metadata(
+    output_dir: Path, source: SourceType | None = None
+) -> tuple[int, int, int]:
     """Return final Parquet file count, record count, and total size in bytes."""
-    output_files = sorted(output_dir.glob("*.parquet")) if output_dir.exists() else []
+    pattern = f"{source}_for_uk_address_matcher.chunk_*.parquet" if source else "*.parquet"
+    output_files = sorted(output_dir.glob(pattern)) if output_dir.exists() else []
     total_size = sum(path.stat().st_size for path in output_files)
     if not output_files:
         return 0, 0, 0
@@ -87,7 +98,7 @@ def _collect_output_metadata(output_dir: Path) -> tuple[int, int, int]:
 
 def _format_output_metadata(output_dir: Path, source: SourceType) -> str:
     """Format useful metadata for final address-matcher outputs."""
-    file_count, record_count, total_size = _collect_output_metadata(output_dir)
+    file_count, record_count, total_size = _collect_output_metadata(output_dir, source)
     file_pattern = f"{source}_for_uk_address_matcher.chunk_**.parquet"
     if file_count == 0:
         return (
@@ -121,9 +132,26 @@ def _render_yaml_list(key: str, values: list[object], *, indent: int = 2) -> str
     return "\n".join(lines) + "\n"
 
 
+def _format_cloud_output_metadata(settings: Settings) -> str:
+    destination = build_writer(settings, settings.source.type)
+    manifest = destination.completed_manifest()
+    if manifest is None:
+        raise SettingsError("Cloud output has no completion manifest")
+    total_rows = sum(chunk.rows for chunk in manifest.chunks)
+    total_size = sum(chunk.size_bytes for chunk in manifest.chunks)
+    return (
+        "Output metadata:\n"
+        f"  Destination: {destination.location}\n"
+        f"  Chunks: {len(manifest.chunks)}\n"
+        f"  total records: {total_rows:,}\n"
+        f"  total object size: {format_size(total_size)} ({total_size:,} bytes)"
+    )
+
+
 def render_annotated_config(config: dict[str, object]) -> str:
     """Render config YAML with explanatory comments."""
     paths = config["paths"]
+    paths_yaml = yaml.safe_dump({"paths": paths}, sort_keys=False)
     os_downloads = config["os_downloads"]
     processing = config["processing"]
     ngd_excluded_stems = parse_ngd_excluded_stems(processing.get("ngd_excluded_stems"))
@@ -145,20 +173,25 @@ def render_annotated_config(config: dict[str, object]) -> str:
         if duckdb_memory_limit
         else '  # duckdb_memory_limit: "8GB"\n'
     )
+    output_yaml = ""
+    if config.get("output") is not None:
+        output = OutputSettings.model_validate(config["output"])
+        output_yaml = (
+            "\n# Optional provider settings; destination is selected by paths\n"
+            + yaml.safe_dump(
+                {"output": output.model_dump(exclude_none=True)},
+                sort_keys=False,
+            )
+        )
 
     return (
         "# UKAM OS Builder Configuration\n"
-        "# All paths are relative to this config file's directory unless absolute\n\n"
-        "paths:\n"
-        "  # Base working directory for all data\n"
-        f"  work_dir: {paths['work_dir']}\n"
-        "\n"
-        "  # Most users won't need this: override derived directories only if required\n"
-        "  # overrides:\n"
-        "  #   downloads_dir: ./somewhere/downloads\n"
-        "  #   extracted_dir: /mnt/fast/extracted\n"
-        "  #   parquet_dir: ./data/parquet\n"
-        "  #   output_dir: ./output\n\n"
+        "# Local paths are relative to this config file unless absolute\n"
+        "# work_dir may be a local directory or an s3:// or az:// base\n"
+        "# A cloud base publishes final files under <base>/output; processing stays local\n"
+        "# Optional paths.cache_dir controls local processing for a cloud base (default ./data)\n"
+        "# Optional paths.overrides.output_dir selects an exact local or cloud destination\n"
+        f"{paths_yaml}\n"
         "source:\n"
         "  # Source dataset to process: ngd or abp\n"
         f"  type: {config['source']['type']}\n\n"
@@ -194,6 +227,7 @@ def render_annotated_config(config: dict[str, object]) -> str:
         f"  # Valid values: {format_valid_abp_excluded_logical_statuses()} "
         "(1=approved, 3=alternative, 6=provisional, 8=historic)\n"
         f"{abp_excluded_logical_statuses_yaml}"
+        f"{output_yaml}"
     )
 
 
@@ -209,6 +243,7 @@ def load_existing_defaults(config_path: Path) -> dict[str, object]:
     merged = defaults | loaded
     loaded_paths = loaded.get("paths") if isinstance(loaded.get("paths"), dict) else {}
     merged["paths"] = {
+        **loaded_paths,
         "work_dir": loaded_paths.get("work_dir", defaults["paths"]["work_dir"]),
         "overrides": dict(loaded_paths.get("overrides") or {}),
     }
@@ -299,8 +334,9 @@ def create_config_and_env(
     version_id: str,
     source: SourceType,
     overwrite_env: bool = False,
-    paths: dict[str, str] | None = None,
+    paths: dict[str, Any] | None = None,
     processing: dict[str, Any] | None = None,
+    output: dict[str, Any] | OutputSettings | None = None,
     ngd_excluded_stems: list[str] | None = None,
     abp_excluded_logical_statuses: list[int] | None = None,
     api_key: str | None = None,
@@ -323,6 +359,10 @@ def create_config_and_env(
         config["paths"] = {**config["paths"], **paths}
     if processing:
         config["processing"] = {**config["processing"], **processing}
+    if output is not None:
+        config["output"] = (
+            OutputSettings.model_validate(output).model_dump(exclude_none=True) if output else None
+        )
     if ngd_excluded_stems is not None:
         config["processing"]["ngd_excluded_stems"] = parse_ngd_excluded_stems(ngd_excluded_stems)
     if abp_excluded_logical_statuses is not None:
@@ -367,20 +407,45 @@ def apply_run_overrides(
     if version_id:
         settings.os_downloads.version_id = version_id
 
-    if work_dir:
-        settings.paths.work_dir = Path(work_dir).resolve()
-        settings.paths.downloads_dir = settings.paths.work_dir / "downloads"
-        settings.paths.extracted_dir = settings.paths.work_dir / "extracted"
-        settings.paths.parquet_dir = settings.paths.work_dir / "parquet"
-        settings.paths.output_dir = settings.paths.work_dir / "output"
-    if downloads_dir:
-        settings.paths.downloads_dir = Path(downloads_dir).resolve()
-    if extracted_dir:
-        settings.paths.extracted_dir = Path(extracted_dir).resolve()
-    if output_dir:
-        settings.paths.output_dir = Path(output_dir).resolve()
-    if schema_path:
-        settings.paths.schema_path = Path(schema_path).resolve()
+    if any(
+        value is not None
+        for value in [work_dir, downloads_dir, extracted_dir, output_dir, schema_path]
+    ):
+        overrides = (
+            {}
+            if work_dir
+            else {
+                name: str(getattr(settings.paths, name))
+                for name in ["downloads_dir", "extracted_dir", "parquet_dir", "output_dir"]
+                if getattr(settings.paths, name) is not None
+            }
+        )
+        overrides.update(
+            {
+                name: str(value)
+                for name, value in [
+                    ("downloads_dir", downloads_dir),
+                    ("extracted_dir", extracted_dir),
+                    ("output_dir", output_dir),
+                ]
+                if value is not None
+            }
+        )
+        path_config = {
+            "work_dir": str(work_dir if work_dir is not None else settings.paths.work_dir),
+            "cache_dir": str(settings.paths.work_dir),
+            "overrides": overrides,
+            "schema_path": str(schema_path or settings.paths.schema_path)
+            if schema_path or settings.paths.schema_path
+            else None,
+        }
+        settings.paths = PathSettings.model_validate(
+            resolve_paths({"paths": path_config}, Path.cwd())
+        )
+        if not isinstance(
+            settings.paths.output_dir, str
+        ) or not settings.paths.output_dir.startswith("s3://"):
+            settings.output = None
 
     if num_chunks is not None:
         if num_chunks < 1:
@@ -495,10 +560,12 @@ def run_from_config(
         "  • downloads_dir (raw OS Hub extracts): %s%s\n"
         "  • output_dir (final files for address matcher): %s%s"
     )
-    if step in {"all", "flatfile"}:
-        completion_message += "\n\n" + _format_output_metadata(
-            settings.paths.output_dir,
-            source_type,
+    if step in {"all", "flatfile"} and not list_only:
+        destination = build_writer(settings, source_type)
+        completion_message += "\n\n" + (
+            _format_cloud_output_metadata(settings)
+            if destination.is_remote
+            else _format_output_metadata(Path(destination.location), source_type)
         )
 
     logger.info(

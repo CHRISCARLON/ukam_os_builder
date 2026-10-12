@@ -143,9 +143,6 @@ def main(argv: list[str] | None = None) -> int:
         config["source"]["type"] = args.source
         config["os_downloads"]["package_id"] = args.package_id
         config["os_downloads"]["version_id"] = args.version_id
-        config["paths"] = {
-            "work_dir": str(config.get("paths", {}).get("work_dir", "./data")),
-        }
     else:
         console.print(
             Panel.fit(
@@ -174,10 +171,10 @@ def main(argv: list[str] | None = None) -> int:
 
         console.print("\n[bold]Paths[/bold]")
         work_dir = _prompt_non_empty(
-            "Where should the tool store its working data?",
+            "Base location (local, s3:// or az://; cloud stores final output only)",
             str(config.get("paths", {}).get("work_dir", "./data")),
         )
-        config["paths"] = {"work_dir": work_dir}
+        config["paths"]["work_dir"] = work_dir
 
         if _confirm("Configure advanced processing settings?", default_yes=False):
             config["processing"]["num_chunks"] = _prompt_int(

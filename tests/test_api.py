@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from textwrap import dedent
+from types import SimpleNamespace
 from typing import Literal
 
 import duckdb
@@ -11,14 +12,182 @@ import requests
 
 from ukam_os_builder.api.api import (
     _collect_output_metadata,
+    _format_cloud_output_metadata,
     _format_output_metadata,
+    apply_run_overrides,
     create_config_and_env,
     run_from_config,
 )
+from ukam_os_builder.api.settings import load_settings
+from ukam_os_builder.os_builder.output import S3Writer
 
 
 def _write_config(path: Path, content: str) -> None:
     path.write_text(dedent(content).strip() + "\n")
+
+
+def test_local_summary_does_not_count_preserved_other_source_files(tmp_path: Path) -> None:
+    with duckdb.connect() as connection:
+        for source, rows in [("ngd", 2), ("abp", 7)]:
+            path = tmp_path / f"{source}_for_uk_address_matcher.chunk_001_of_001.parquet"
+            connection.sql(f"SELECT range AS unique_id FROM range({rows})").write_parquet(str(path))
+    summary = _format_output_metadata(tmp_path, "ngd")
+    assert "Chunks: 1" in summary
+    assert "total records: 2" in summary
+
+
+@pytest.mark.parametrize(
+    "output_dir,options",
+    [
+        (
+            "s3://test-bucket/outputs: ngd",
+            {"aws": {"region": "eu-west-2", "profile": "development", "credential_chain": ["sso"]}},
+        ),
+        ("az://testaccount.blob.core.windows.net/outputs/abp", None),
+    ],
+)
+def test_cloud_config_roundtrip_and_regeneration(
+    tmp_path: Path, output_dir: str, options: dict | None
+) -> None:
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source="ngd",
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": "./data", "overrides": {"output_dir": output_dir}},
+        output=options,
+    )
+    settings = load_settings(config, load_env=False)
+    assert settings.paths.output_dir == output_dir
+    assert (settings.output.model_dump(exclude_none=True) if settings.output else None) == options
+    create_config_and_env(config, tmp_path / ".env", source="abp", package_id="1", version_id="2")
+    reloaded = load_settings(config, load_env=False)
+    assert reloaded.paths.output_dir == output_dir
+    assert (reloaded.output.model_dump(exclude_none=True) if reloaded.output else None) == options
+
+
+def test_cloud_output_overrides_do_not_resolve_uri_as_path(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source="ngd",
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": "s3://test-bucket/old"},
+        output={
+            "aws": {"profile": "development"},
+        },
+    )
+    settings = load_settings(config, load_env=False)
+    apply_run_overrides(settings, output_dir="s3://test-bucket/new")
+    assert settings.paths.output_dir == "s3://test-bucket/new"
+    assert settings.output.aws.profile == "development"
+    apply_run_overrides(
+        settings,
+        work_dir="az://testaccount.blob.core.windows.net/outputs",
+        output_dir="az://testaccount.blob.core.windows.net/outputs/new",
+    )
+    assert settings.paths.output_dir == "az://testaccount.blob.core.windows.net/outputs/new"
+    assert settings.output is None
+
+
+@pytest.mark.parametrize(
+    "base", ["s3://test-bucket/base", "az://account.blob.core.windows.net/container"]
+)
+def test_cloud_base_and_cache_survive_config_regeneration(tmp_path: Path, base: str) -> None:
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source="ngd",
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": base, "cache_dir": "./scratch"},
+    )
+    create_config_and_env(config, tmp_path / ".env", source="abp", package_id="1", version_id="2")
+
+    settings = load_settings(config, load_env=False)
+    assert settings.paths.output_dir == base + "/output"
+    assert settings.paths.work_dir == tmp_path / "scratch"
+    assert settings.paths.parquet_dir == tmp_path / "scratch/parquet"
+
+
+def test_runtime_cloud_base_keeps_local_cache_and_local_output_override(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source="ngd",
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": "s3://test-bucket/base", "cache_dir": "./scratch"},
+        output={"aws": {"profile": "development"}},
+    )
+    settings = load_settings(config, load_env=False)
+    apply_run_overrides(settings, work_dir="s3://test-bucket/new")
+    assert settings.paths.output_dir == "s3://test-bucket/new/output"
+    assert settings.paths.work_dir == tmp_path / "scratch"
+    assert settings.paths.downloads_dir == tmp_path / "scratch/downloads"
+
+    apply_run_overrides(settings, output_dir=tmp_path / "final")
+    assert settings.paths.output_dir == tmp_path / "final"
+    assert settings.paths.parquet_dir == tmp_path / "scratch/parquet"
+    assert settings.output is None
+
+
+@pytest.mark.parametrize("step,list_only", [("download", False), ("all", True)])
+def test_download_and_listing_do_not_authenticate_cloud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, list_only: bool
+) -> None:
+    import fsspec
+
+    import ukam_os_builder.api.api as api_module
+
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source="ngd",
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": "s3://test-bucket"},
+    )
+    monkeypatch.setattr(api_module, "run_pipeline", lambda **kwargs: None)
+
+    def unexpected_filesystem(*args, **kwargs):
+        raise AssertionError("Cloud authentication is not needed for downloads/listing")
+
+    monkeypatch.setattr(fsspec, "filesystem", unexpected_filesystem)
+    settings = run_from_config(config, step=step, list_only=list_only, check_api=False)
+    assert settings.paths.output_dir == "s3://test-bucket/output"
+
+
+@pytest.mark.parametrize("source", ["ngd", "abp"])
+def test_cloud_summary_uses_manifest_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    config = tmp_path / "config.yaml"
+    create_config_and_env(
+        config,
+        tmp_path / ".env",
+        source=source,
+        package_id="1",
+        version_id="1",
+        paths={"work_dir": "s3://test-bucket"},
+    )
+    settings = load_settings(config, load_env=False)
+    manifest = SimpleNamespace(
+        chunks=[SimpleNamespace(rows=12, size_bytes=100), SimpleNamespace(rows=0, size_bytes=100)]
+    )
+    monkeypatch.setattr(S3Writer, "completed_manifest", lambda self: manifest)
+    summary = _format_cloud_output_metadata(settings)
+    assert "s3://test-bucket/output" in summary
+    assert "Chunks: 2" in summary
+    assert "total records: 12" in summary
+    assert "200 bytes" in summary
 
 
 def test_create_config_and_env_writes_expected_files(tmp_path: Path) -> None:
@@ -103,7 +272,7 @@ def test_format_output_metadata_formats_counts_and_size(
 ) -> None:
     monkeypatch.setattr(
         "ukam_os_builder.api.api._collect_output_metadata",
-        lambda _output_dir: (2, 71438939, 437170782),
+        lambda _output_dir, _source=None: (2, 71438939, 437170782),
     )
 
     assert _format_output_metadata(tmp_path, "ngd") == (

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from ukam_os_builder import setup_wizard
 
@@ -14,6 +15,47 @@ def _input_feeder(values: list[str]):
         return next(iterator)
 
     return _fake_input
+
+
+@pytest.mark.parametrize("non_interactive", [False, True])
+def test_setup_wizard_preserves_cloud_base_cache_and_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, non_interactive: bool
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    paths = {
+        "work_dir": "s3://test-bucket/base",
+        "cache_dir": "./scratch",
+        "overrides": {"output_dir": "s3://test-bucket/final"},
+    }
+    config_path.write_text(yaml.safe_dump({"paths": paths}), encoding="utf-8")
+    monkeypatch.setattr(
+        setup_wizard.console, "input", _input_feeder(["", "pkg-1", "ver-1", "", "n", "n"])
+    )
+    captured: dict[str, object] = {}
+
+    def fake_write_config_and_env(**kwargs):
+        captured.update(kwargs)
+        return Path(kwargs["config_out"]).resolve(), Path(kwargs["env_out"]).resolve(), False
+
+    monkeypatch.setattr(setup_wizard, "write_config_and_env", fake_write_config_and_env)
+    arguments = ["--config-out", str(config_path), "--env-out", str(tmp_path / ".env")]
+    if non_interactive:
+        arguments.extend(
+            [
+                "--non-interactive",
+                "--source",
+                "ngd",
+                "--package-id",
+                "pkg-1",
+                "--version-id",
+                "ver-1",
+            ]
+        )
+
+    assert setup_wizard.main(arguments) == 0
+    config = captured["config"]
+    assert isinstance(config, dict)
+    assert config["paths"] == paths
 
 
 def test_setup_wizard_prompts_for_env_credentials_and_overwrites_existing(

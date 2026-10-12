@@ -78,10 +78,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override OS_PROJECT_API_SECRET for this run.",
     )
 
-    parser.add_argument("--work-dir", help="Override paths.work_dir.")
-    parser.add_argument("--downloads-dir", help="Override paths.downloads_dir.")
-    parser.add_argument("--extracted-dir", help="Override paths.extracted_dir.")
-    parser.add_argument("--output-dir", help="Override paths.output_dir.")
+    parser.add_argument(
+        "--work-dir",
+        help="Base location: local directory or s3:// / az:// prefix; cloud bases publish final files under output/ with local processing.",
+    )
+    parser.add_argument("--downloads-dir", help="Override the local downloads directory.")
+    parser.add_argument("--extracted-dir", help="Override the local extracted directory.")
+    parser.add_argument(
+        "--output-dir",
+        help="Exact final directory: local path, s3://bucket/prefix or az://account.blob.core.windows.net/container/prefix.",
+    )
     parser.add_argument("--schema-path", help="Override paths.schema_path (ABP split schema).")
 
     parser.add_argument("--num-chunks", type=int, help="Override processing.num_chunks.")

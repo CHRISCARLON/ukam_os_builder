@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import cache
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import duckdb
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from ukam_os_builder.data_sources.abp.abp_exclusions import (
     DEFAULT_ABP_EXCLUDED_LOGICAL_STATUSES,
@@ -40,9 +50,17 @@ class PathSettings(StrictBaseModel):
     work_dir: Path
     downloads_dir: Path
     extracted_dir: Path
-    output_dir: Path
+    output_dir: Path | str
     parquet_dir: Path | None = None
     schema_path: Path | None = None
+
+    @field_validator("output_dir", mode="before")
+    @classmethod
+    def _validate_output_dir(cls, value: Path | str) -> Path | str:
+        text = str(value)
+        if urlsplit(text).scheme in {"s3", "az"}:
+            return normalize_cloud_output_path(text)
+        return value if "://" in text else Path(value)
 
 
 class SourceSettings(StrictBaseModel):
@@ -122,6 +140,70 @@ class ProcessingSettings(StrictBaseModel):
         return normalise_abp_excluded_logical_statuses(value)
 
 
+class AWSOutputSettings(StrictBaseModel):
+    """Non-secret AWS identity and bucket options."""
+
+    region: str | None = None
+    profile: str | None = None
+    credential_chain: list[Literal["env", "config", "sso", "instance", "process"]] | None = None
+    kms_key_id: str | None = None
+
+    @field_validator("region", "profile", "kms_key_id")
+    @classmethod
+    def _validate_option(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.strip()
+            if not value:
+                raise ValueError("must be non-empty")
+        return value
+
+    @field_validator("credential_chain")
+    @classmethod
+    def _validate_chain(cls, value: list[str] | None) -> list[str] | None:
+        if value == []:
+            raise ValueError("must contain at least one credential provider")
+        return value
+
+
+def normalize_cloud_output_path(value: str) -> str:
+    path = value.strip().rstrip("/")
+    parsed = urlsplit(path)
+    if (
+        parsed.scheme not in {"s3", "az"}
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or ":" in parsed.netloc
+        or any(character in path for character in "*?[]%\\")
+        or any(ord(character) < 32 for character in path)
+    ):
+        raise ValueError(
+            "must be an s3:// or fully qualified az:// path without URI escapes or wildcards"
+        )
+    segments = parsed.path.lstrip("/").split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError(
+            "must include an explicit output prefix without empty or relative segments"
+        )
+    if parsed.scheme == "s3":
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", parsed.netloc):
+            raise ValueError("must include a valid S3 bucket name")
+    elif (
+        not re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", parsed.netloc)
+        or len(segments) < 2
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", segments[0])
+    ):
+        raise ValueError("must be az://<account>.blob.core.windows.net/<container>/<prefix>")
+    return path
+
+
+class OutputSettings(StrictBaseModel):
+    """Optional provider settings; paths.output_dir selects the destination."""
+
+    aws: AWSOutputSettings | None = None
+
+
 class Settings(StrictBaseModel):
     """Complete application settings."""
 
@@ -129,7 +211,14 @@ class Settings(StrictBaseModel):
     source: SourceSettings = SourceSettings()
     os_downloads: OSDownloadSettings
     processing: ProcessingSettings
+    output: OutputSettings | None = None
     config_path: Path
+
+    @model_validator(mode="after")
+    def _validate_provider_options(self) -> Settings:
+        if self.output and self.output.aws and urlsplit(str(self.paths.output_dir)).scheme != "s3":
+            raise ValueError("output.aws options require an s3:// output_dir")
+        return self
 
 
 class SettingsError(Exception):
@@ -149,26 +238,47 @@ class SettingsError(Exception):
 
 def _resolve_path(base_dir: Path, path_str: str) -> Path:
     """Resolve a path relative to the config file directory."""
+    if "://" in path_str:
+        raise SettingsError(
+            "Downloads, intermediates and cache must be local paths; use work_dir or output_dir for cloud publication"
+        )
     path = Path(path_str)
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
 
 
-def resolve_paths(config: dict[str, Any], config_dir: Path) -> dict[str, Path | None]:
+def resolve_output_path(base_dir: Path, value: str | Path) -> Path | str:
+    text = str(value)
+    if urlsplit(text).scheme in {"s3", "az"}:
+        try:
+            return normalize_cloud_output_path(text)
+        except ValueError as exc:
+            raise SettingsError(f"Invalid output directory: {exc}") from exc
+    return text if "://" in text else _resolve_path(base_dir, text)
+
+
+def resolve_paths(config: dict[str, Any], config_dir: Path) -> dict[str, Path | str | None]:
     """Resolve all runtime paths from config using work_dir defaults and optional overrides."""
     paths_config = config.get("paths", {})
     if not isinstance(paths_config, dict):
         raise SettingsError("paths must be a mapping in config.yaml")
 
     work_dir_raw = str(paths_config.get("work_dir", "./data"))
-    work_dir = _resolve_path(config_dir, work_dir_raw)
+    url_base = "://" in work_dir_raw or urlsplit(work_dir_raw).scheme in {"s3", "az"}
+    work_dir = _resolve_path(
+        config_dir, str(paths_config.get("cache_dir", "./data")) if url_base else work_dir_raw
+    )
 
     defaults = {
         "downloads_dir": work_dir / "downloads",
         "extracted_dir": work_dir / "extracted",
         "parquet_dir": work_dir / "parquet",
-        "output_dir": work_dir / "output",
+        "output_dir": (
+            resolve_output_path(config_dir, work_dir_raw.rstrip("/") + "/output")
+            if url_base
+            else work_dir / "output"
+        ),
     }
 
     raw_overrides = paths_config.get("overrides") or {}
@@ -183,11 +293,15 @@ def resolve_paths(config: dict[str, Any], config_dir: Path) -> dict[str, Path | 
             f"{illegal_display} are no longer supported. Use paths.overrides instead."
         )
 
-    overrides: dict[str, Path] = {}
+    overrides: dict[str, Path | str] = {}
     for key in defaults:
         value = raw_overrides.get(key)
         if value is not None:
-            overrides[key] = _resolve_path(config_dir, str(value))
+            overrides[key] = (
+                resolve_output_path(config_dir, str(value))
+                if key == "output_dir"
+                else _resolve_path(config_dir, str(value))
+            )
 
     schema_path_value = paths_config.get("schema_path")
 
