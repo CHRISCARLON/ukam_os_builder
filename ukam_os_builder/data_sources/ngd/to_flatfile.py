@@ -18,17 +18,12 @@ from time import perf_counter
 import duckdb
 
 from ukam_os_builder._exceptions import ToFlatfileError
-from ukam_os_builder.api.settings import (
-    OutputTarget,
-    Settings,
-    configure_azure_output,
-    create_duckdb_connection,
-)
+from ukam_os_builder.api.settings import Settings
 from ukam_os_builder.data_sources.ngd.ngd_exclusions import (
     get_configured_ngd_excluded_stems,
     ngd_file_matches_excluded_stem,
 )
-from ukam_os_builder.os_builder.extract import _sql_string
+from ukam_os_builder.os_builder.output import Writer, build_writer
 
 logger = logging.getLogger(__name__)
 
@@ -691,18 +686,6 @@ def _ensure_uprn_column(con: duckdb.DuckDBPyConnection, parquet_paths: list[Path
         raise ToFlatfileError("UPRN column missing from required parquet files: " + missing_list)
 
 
-def _list_outputs(
-    con: duckdb.DuckDBPyConnection, settings: Settings, pattern: str
-) -> list[Path | str]:
-    if settings.output_target is OutputTarget.BLOB:
-        rows = con.execute("SELECT file FROM glob(?)", [f"{settings.output_blob.uri}/{pattern}"])
-        return sorted(row[0] for row in rows.fetchall())
-    output_dir = settings.paths.output_dir
-    if not output_dir.exists():
-        return []
-    return sorted(output_dir.glob(pattern))
-
-
 def run_flatfile_step(settings: Settings, force: bool = False) -> list[Path | str]:
     """Run the flatfile step of the pipeline.
 
@@ -714,57 +697,22 @@ def run_flatfile_step(settings: Settings, force: bool = False) -> list[Path | st
         force: Force recreation even if output exists.
 
     Returns:
-        List of output parquet file paths, or blob URIs when ``output_blob`` is set.
+        List of output parquet file paths.
 
     Raises:
         ToFlatfileError: If transformation fails.
     """
-    con = create_duckdb_connection(settings)
-    try:
-        return _run_flatfile_step(con, settings, force)
-    finally:
-        con.close()
-
-
-def _run_flatfile_step(
-    con: duckdb.DuckDBPyConnection, settings: Settings, force: bool
-) -> list[Path | str]:
     t0 = perf_counter()
 
     parquet_dir = settings.paths.extracted_dir / "parquet"
-    output_dir = settings.paths.output_dir
-    num_chunks = settings.processing.num_chunks
-
-    target = settings.output_target
-    blob = settings.output_blob
-    output_location = blob.uri if target is OutputTarget.BLOB else output_dir.as_posix()
-    configure_azure_output(con, settings)
-
-    # Check for existing output
-    output_pattern = "ngd_for_uk_address_matcher.chunk_*.parquet"
-    existing_outputs = _list_outputs(con, settings, output_pattern)
-
-    if existing_outputs and not force:
+    destination = build_writer(settings, "ngd")
+    existing_outputs = destination.existing_outputs(force)
+    if existing_outputs:
         logger.info(
-            "Output files already exist (%d files) in %s. Use --force to regenerate.",
+            "Output files already exist (%d files). Use --overwrite to regenerate.",
             len(existing_outputs),
-            output_location,
         )
         return existing_outputs
-
-    # Clear existing outputs on force. DuckDB can't delete blobs, so remote chunks are
-    # overwritten in place and any left over from a different num_chunks stay behind (needs improved).
-    if existing_outputs and force:
-        if target is OutputTarget.BLOB:
-            logger.warning(
-                "Overwriting existing outputs in %s; delete any stale chunk files manually "
-                "if num_chunks has changed",
-                output_location,
-            )
-        else:
-            for f in existing_outputs:
-                f.unlink()
-                logger.debug("Removed existing output: %s", f.name)
 
     # Check parquet directory exists
     if not parquet_dir.exists():
@@ -791,12 +739,6 @@ def _run_flatfile_step(
 
     logger.info("Processing %d parquet files from %s", len(parquet_files), parquet_dir)
 
-    # Set temp directory for spill
-    output_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = output_dir / "duckdb_tmp"
-    temp_dir.mkdir(exist_ok=True)
-    con.execute(f"PRAGMA temp_directory='{temp_dir.as_posix()}'")
-
     # Validate UPRN availability in all address parquet files
     address_parquet_files: list[Path] = []
     for path in sorted(parquet_files):
@@ -808,7 +750,27 @@ def _run_flatfile_step(
         raise ToFlatfileError("No valid address parquet files found to process.")
 
     logger.info("Checking UPRN availability in %d parquet files", len(address_parquet_files))
-    _ensure_uprn_column(con, address_parquet_files)
+    with destination.connection() as con:
+        _ensure_uprn_column(con, address_parquet_files)
+        destination.prepare(con, force)
+        output_files = _write_flatfiles(settings, destination, con, parquet_dir, parquet_files)
+        destination.finish()
+
+    elapsed = perf_counter() - t0
+    logger.info(
+        "Flatfile step completed in %.2f seconds. Output: %d file(s)", elapsed, len(output_files)
+    )
+    return output_files
+
+
+def _write_flatfiles(
+    settings: Settings,
+    destination: Writer,
+    con: duckdb.DuckDBPyConnection,
+    parquet_dir: Path,
+    parquet_files: list[Path],
+) -> list[Path | str]:
+    num_chunks = settings.processing.num_chunks
 
     # Export to parquet file(s)
     output_files: list[Path | str] = []
@@ -887,37 +849,21 @@ def _run_flatfile_step(
         )
 
         # Export chunk
-        if chunk_total <= 1:
-            chunk_name = "ngd_for_uk_address_matcher.chunk_001_of_001.parquet"
-        else:
-            chunk_name = f"ngd_for_uk_address_matcher.chunk_{chunk_index + 1:03d}_of_{chunk_total:03d}.parquet"
-        if target is OutputTarget.BLOB:
-            # if we set the target here as the blobl uri
-            # the copy statement below uses it automatically
-            output_path: Path | str = f"{blob.uri}/{chunk_name}"
-            copy_target = output_path
-        else:
-            output_path = output_dir / chunk_name
-            copy_target = output_path.as_posix()
+        chunk_name = destination.chunk_name(chunk_index)
 
-        logger.info("Exporting chunk %d/%d: %s", chunk_index + 1, chunk_total, output_path)
+        logger.info("Exporting chunk %d/%d: %s", chunk_index + 1, chunk_total, chunk_name)
 
         order_clause = (
             "ORDER BY postcode, unique_id" if settings.processing.sort_output_by_postcode else ""
         )
-        compression = _sql_string(settings.processing.parquet_compression)
-        compression_level = settings.processing.parquet_compression_level
-        con.execute(f"""
-            COPY (
-                SELECT * FROM all_full_addresses_dedup
-                {order_clause}
-            ) TO '{_sql_string(copy_target)}' (
-                FORMAT 'PARQUET',
-                COMPRESSION '{compression}',
-                COMPRESSION_LEVEL {compression_level}
-            );
-        """)
-
+        output_path = destination.write_query(
+            con,
+            f"SELECT * FROM all_full_addresses_dedup {order_clause}",
+            chunk_index,
+            chunk_count,
+            compression=settings.processing.parquet_compression,
+            compression_level=settings.processing.parquet_compression_level,
+        )
         return output_path, chunk_count
 
     if num_chunks <= 1:
@@ -933,18 +879,5 @@ def _run_flatfile_step(
             total_count += chunk_count
 
     logger.info("Total addresses after deduplication: %d", total_count)
-
-    # Cleanup temp directory
-    try:
-        import shutil
-
-        shutil.rmtree(temp_dir)
-    except Exception as e:
-        logger.warning("Failed to remove temp directory %s: %s", temp_dir, e)
-
-    elapsed = perf_counter() - t0
-    logger.info(
-        "Flatfile step completed in %.2f seconds. Output: %d file(s)", elapsed, len(output_files)
-    )
 
     return output_files

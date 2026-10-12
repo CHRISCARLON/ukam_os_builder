@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from ukam_os_builder.api.settings import OutputTarget, Settings
+from ukam_os_builder.api.settings import Settings
 from ukam_os_builder.data_sources.abp.split_raw import run_split_step
 from ukam_os_builder.data_sources.abp.transform.runner import (
     run_flatfile_step as run_abp_flatfile_step,
@@ -41,12 +41,11 @@ _NGD_PIPELINE = PipelineDefinition(
             "parquet/*.parquet",
             *COMMON_BLOAT_PATTERNS,
         ],
-        "output_dir": ["*.parquet"],
     },
     step_outputs={
         "download": [],
         "extract": ["extracted_dir"],
-        "flatfile": ["output_dir"],
+        "flatfile": [],
     },
 )
 
@@ -68,13 +67,12 @@ _ABP_PIPELINE = PipelineDefinition(
             "raw/*.parquet",
             *COMMON_BLOAT_PATTERNS,
         ],
-        "output_dir": ["*.parquet"],
     },
     step_outputs={
         "download": [],
         "extract": ["extracted_dir"],
         "split": ["parquet_dir"],
-        "flatfile": ["output_dir"],
+        "flatfile": [],
     },
 )
 
@@ -104,9 +102,6 @@ def run(
     list_only: bool = False,
 ) -> None:
     source = settings.source.type
-
-    if settings.output_target is OutputTarget.BLOB and source != "ngd":
-        raise ValueError("output_blob functionality is currently only supported for source type: ngd")
     definition = _definition_for_source(source)
 
     run_pipeline(

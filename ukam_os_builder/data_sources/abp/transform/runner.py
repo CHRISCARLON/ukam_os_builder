@@ -27,7 +27,9 @@ import logging
 from pathlib import Path
 from time import perf_counter
 
-from ukam_os_builder.api.settings import Settings, create_duckdb_connection
+import duckdb
+
+from ukam_os_builder.api.settings import Settings
 from ukam_os_builder.data_sources.abp.abp_exclusions import (
     get_configured_abp_excluded_logical_statuses,
 )
@@ -38,25 +40,10 @@ from ukam_os_builder.data_sources.abp.transform.common import (
     register_parquet_view,
 )
 from ukam_os_builder.data_sources.abp.transform.stages import business, combine, lpi, misc, postal
+from ukam_os_builder.os_builder.extract import _sql_string
+from ukam_os_builder.os_builder.output import Writer, build_writer
 
 logger = logging.getLogger(__name__)
-
-
-def _get_chunk_output_path(output_dir: Path, chunk_id: int, num_chunks: int) -> Path:
-    """Generate output path for a specific chunk.
-
-    Args:
-        output_dir: Base output directory.
-        chunk_id: Zero-based chunk index.
-        num_chunks: Total number of chunks.
-
-    Returns:
-        Path like output_dir/abp_for_uk_address_matcher.chunk_001_of_010.parquet
-    """
-    return (
-        output_dir
-        / f"abp_for_uk_address_matcher.chunk_{chunk_id + 1:03d}_of_{num_chunks:03d}.parquet"
-    )
 
 
 def _transform_to_flatfile_chunk(
@@ -64,7 +51,8 @@ def _transform_to_flatfile_chunk(
     chunk_id: int,
     num_chunks: int,
     force: bool = False,
-) -> Path:
+    destination: Writer | None = None,
+) -> Path | str:
     """Transform split parquet files into flatfile for a single chunk.
 
     This is the internal workhorse that processes one chunk of UPRNs.
@@ -83,11 +71,11 @@ def _transform_to_flatfile_chunk(
         ToFlatfileError: If transformation fails.
     """
     parquet_dir = settings.paths.parquet_dir / "raw"
-    output_dir = settings.paths.output_dir
-    output_path = _get_chunk_output_path(output_dir, chunk_id, num_chunks)
+    destination = destination or build_writer(settings, "abp")
+    output_path = destination.target(destination.chunk_name(chunk_id))
 
     # Check if output exists
-    if output_path.exists() and not force:
+    if isinstance(output_path, Path) and output_path.exists() and not force:
         logger.info(
             "Chunk %d/%d output already exists: %s",
             chunk_id + 1,
@@ -96,12 +84,23 @@ def _transform_to_flatfile_chunk(
         )
         return output_path
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with destination.connection() as con:
+        destination.configure_connection(con)
+        return _write_flatfile_chunk(
+            con, destination, settings, parquet_dir, output_path, chunk_id, num_chunks
+        )
 
+
+def _write_flatfile_chunk(
+    con: duckdb.DuckDBPyConnection,
+    destination: Writer,
+    settings: Settings,
+    parquet_dir: Path,
+    output_path: Path | str,
+    chunk_id: int,
+    num_chunks: int,
+) -> Path | str:
     chunk_start = perf_counter()
-
-    # Create connection
-    con = create_duckdb_connection(settings)
 
     # Build chunk filter predicate
     # When num_chunks=1: hash(uprn) % 1 = 0 is always true, so this is a no-op
@@ -182,9 +181,7 @@ def _transform_to_flatfile_chunk(
 
     # Write output
     t0 = perf_counter()
-    if output_path.exists():
-        output_path.unlink()
-    result.write_parquet(output_path.as_posix())
+    output_path = destination.write_relation(result, chunk_id, chunk_rows)
     logger.debug("Parquet written in %.2f seconds", perf_counter() - t0)
 
     chunk_duration = perf_counter() - chunk_start
@@ -203,7 +200,7 @@ def _transform_to_flatfile_chunk(
 def transform_to_flatfile(
     settings: Settings,
     force: bool = False,
-) -> list[Path]:
+) -> list[Path | str]:
     """Transform split parquet files into flatfile(s) for address matching.
 
     This is the public entrypoint that handles chunking transparently.
@@ -220,17 +217,25 @@ def transform_to_flatfile(
         ToFlatfileError: If transformation fails.
     """
     parquet_dir = settings.paths.parquet_dir / "raw"
-    output_dir = settings.paths.output_dir
+    destination = build_writer(settings, "abp")
     num_chunks = settings.processing.num_chunks
+
+    if destination.is_remote:
+        existing = destination.existing_outputs(force)
+        if existing:
+            logger.info("Completed cloud output already exists: %s", destination.location)
+            return existing
 
     # Check inputs
     assert_inputs_exist(parquet_dir)
+    with destination.connection() as con:
+        destination.prepare(con, force)
 
     # Log chunking configuration
     logger.info("Starting flatfile chunking: num_chunks=%d", num_chunks)
 
     total_start = perf_counter()
-    output_paths: list[Path] = []
+    output_paths: list[Path | str] = []
 
     for chunk_id in range(num_chunks):
         logger.info("Running chunk %d/%d", chunk_id + 1, num_chunks)
@@ -239,20 +244,22 @@ def transform_to_flatfile(
             chunk_id=chunk_id,
             num_chunks=num_chunks,
             force=force,
+            destination=destination,
         )
         output_paths.append(chunk_path)
 
+    destination.finish()
     total_duration = perf_counter() - total_start
 
     # Final summary
-    if num_chunks == 1:
+    if num_chunks == 1 and not destination.is_remote:
         # For single chunk, also report detailed statistics like before
-        con = create_duckdb_connection(settings)
         output_path = output_paths[0]
-        stats = con.execute(f"""
-            SELECT COUNT(DISTINCT unique_id), COUNT(*)
-            FROM read_parquet('{output_path.as_posix()}')
-        """).fetchone()
+        with destination.connection() as con:
+            stats = con.execute(f"""
+                SELECT COUNT(DISTINCT unique_id), COUNT(*)
+                FROM read_parquet('{_sql_string(str(output_path))}')
+            """).fetchone()
         total_uprns = stats[0]
         total_rows = stats[1]
         variant_uplift_pct = (
@@ -268,7 +275,7 @@ def transform_to_flatfile(
         logger.info(
             "Flatfile completed: wrote %d chunk files to %s",
             num_chunks,
-            output_dir,
+            destination.location,
         )
 
     logger.info("Flatfile transformation completed in %.2f seconds", total_duration)
@@ -276,7 +283,7 @@ def transform_to_flatfile(
     return output_paths
 
 
-def run_flatfile_step(settings: Settings, force: bool = False) -> list[Path]:
+def run_flatfile_step(settings: Settings, force: bool = False) -> list[Path | str]:
     """Run the flatfile step of the pipeline.
 
     Args:
