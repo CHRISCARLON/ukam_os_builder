@@ -117,6 +117,8 @@ def run_pipeline(
         raise PipelineError(
             f"Invalid step: {step}. Must be one of: {', '.join(sorted(valid_steps))}"
         )
+    if list_only and step not in {"all", "download"}:
+        raise PipelineError("list_only can only be used with download or all")
     total_start = perf_counter()
 
     logger.info("=" * 60)

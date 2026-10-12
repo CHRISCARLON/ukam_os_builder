@@ -50,3 +50,21 @@ def test_run_pipeline_rejects_step_not_declared_by_pipeline(temp_settings: Setti
             settings=temp_settings,
             logger=logging.getLogger("test.pipeline_factory"),
         )
+
+
+def test_run_pipeline_rejects_list_only_for_non_download_step(temp_settings: Settings) -> None:
+    definition = PipelineDefinition(
+        dataset_name="abp",
+        steps=(make_standard_step("split", lambda _settings, _force: None),),
+        clean_patterns={},
+        step_outputs={},
+    )
+
+    with pytest.raises(PipelineError, match="list_only can only be used"):
+        run_pipeline(
+            definition=definition,
+            step="split",
+            settings=temp_settings,
+            list_only=True,
+            logger=logging.getLogger("test.pipeline_factory"),
+        )

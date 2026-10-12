@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
-from typing import Literal
 
 import duckdb
 import pytest
@@ -20,6 +19,7 @@ from ukam_os_builder.api.api import (
 )
 from ukam_os_builder.api.settings import load_settings
 from ukam_os_builder.os_builder.output import S3Writer
+from ukam_os_builder.os_builder.pipeline_factory import PipelineRunStep
 
 
 def _write_config(path: Path, content: str) -> None:
@@ -382,7 +382,7 @@ def test_run_from_config_applies_overrides(
         calls["checked_api"] = True
 
     def fake_run_pipeline(
-        step: Literal["all", "download"], settings: object, force: bool, list_only: bool
+        step: PipelineRunStep, settings: object, force: bool, list_only: bool
     ) -> None:
         calls["step"] = step
         calls["force"] = force
@@ -487,7 +487,7 @@ def test_run_from_config_uses_source_override_for_pipeline_validation(
     monkeypatch.setattr("ukam_os_builder.api.api.get_package_version", lambda _settings: None)
 
     def fake_run_pipeline(
-        step: Literal["all", "download"], settings: object, force: bool, list_only: bool
+        step: PipelineRunStep, settings: object, force: bool, list_only: bool
     ) -> None:
         calls["step"] = step
         calls["source"] = settings.source.type
