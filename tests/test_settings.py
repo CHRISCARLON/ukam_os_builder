@@ -6,20 +6,123 @@ from textwrap import dedent
 import pytest
 from pydantic import ValidationError
 
-from ukam_os_builder.api.settings import (
-    OSDownloadSettings,
-    OutputBlobSettings,
-    PathSettings,
-    ProcessingSettings,
-    Settings,
-    SettingsError,
-    configure_azure_output,
-    load_settings,
-)
+from ukam_os_builder.api.settings import SettingsError, load_settings, resolve_output_path
 
 
 def _write_config(path: Path, content: str) -> None:
     path.write_text(dedent(content).strip() + "\n")
+
+
+@pytest.mark.parametrize(
+    "base,expected",
+    [
+        ("s3://test-bucket", "s3://test-bucket/output"),
+        ("s3://test-bucket/canonical/", "s3://test-bucket/canonical/output"),
+        (
+            "az://testaccount.blob.core.windows.net/outputs",
+            "az://testaccount.blob.core.windows.net/outputs/output",
+        ),
+    ],
+)
+def test_cloud_base_derives_final_output_and_local_cache(
+    tmp_path: Path, base: str, expected: str
+) -> None:
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        f"paths: {{work_dir: '{base}', cache_dir: './cache'}}\nos_downloads: {{package_id: '1', version_id: '1'}}",
+    )
+    settings = load_settings(config, load_env=False)
+    assert settings.paths.output_dir == expected
+    assert settings.paths.work_dir == (tmp_path / "cache").resolve()
+    assert settings.paths.downloads_dir == tmp_path / "cache/downloads"
+    assert settings.paths.extracted_dir == tmp_path / "cache/extracted"
+    assert settings.paths.parquet_dir == tmp_path / "cache/parquet"
+
+
+def test_cloud_output_directory_needs_no_uri_option(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        "paths: {work_dir: './data', overrides: {output_dir: 's3://test-bucket/final/'}}\nos_downloads: {package_id: '1', version_id: '1'}",
+    )
+    settings = load_settings(config, load_env=False)
+    assert settings.paths.output_dir == "s3://test-bucket/final"
+    assert settings.paths.work_dir == tmp_path / "data"
+
+
+def test_remote_intermediates_are_rejected_explicitly(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        "paths: {overrides: {extracted_dir: 's3://test-bucket/raw'}}\nos_downloads: {package_id: '1', version_id: '1'}",
+    )
+    with pytest.raises(SettingsError, match="must be local"):
+        load_settings(config, load_env=False)
+
+
+@pytest.mark.parametrize(
+    ("uri", "provider"),
+    [
+        ("s3://test-bucket/output/", "s3"),
+        ("az://testaccount.blob.core.windows.net/outputs/ngd/", "azure"),
+    ],
+)
+def test_cloud_output_normalizes_uri(uri: str, provider: str) -> None:
+    assert resolve_output_path(Path.cwd(), uri) == uri.rstrip("/")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://test-bucket",
+        "s3://test-bucket/",
+        "s3://test-bucket/../output",
+        "s3://test-bucket/output/*",
+        "s3://test-bucket/output?token=secret",
+        "s3://user@test-bucket/output",
+        "s3://test-bucket:443/output",
+        "s3://test-bucket/output/%2e%2e",
+        "s3://test-bucket/output//ngd",
+        "az://testaccount.blob.core.windows.net/outputs",
+        "az://outputs/ngd",
+    ],
+)
+def test_cloud_output_rejects_unsafe_uri(uri: str) -> None:
+    with pytest.raises(SettingsError):
+        resolve_output_path(Path.cwd(), uri)
+
+
+def test_cloud_output_rejects_aws_options_on_azure(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        "paths: {work_dir: 'az://testaccount.blob.core.windows.net/outputs'}\nos_downloads: {package_id: '1', version_id: '1'}\noutput: {aws: {region: 'eu-west-2'}}",
+    )
+    with pytest.raises(SettingsError) as error:
+        load_settings(config, load_env=False)
+    assert "output.aws" in str(error.value.validation_error)
+
+
+def test_cloud_output_loads_without_resolving_uri_as_local_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        """
+    paths:
+      work_dir: ./data
+      overrides: {output_dir: 's3://test-bucket/output'}
+    os_downloads:
+      package_id: "1"
+      version_id: "1"
+    output:
+      aws: {region: eu-west-2, profile: development, credential_chain: [sso]}
+  """,
+    )
+    settings = load_settings(config_path, load_env=False)
+    assert settings.paths.output_dir == "s3://test-bucket/output"
+    assert settings.output.aws.profile == "development"
+    assert settings.paths.work_dir == (tmp_path / "data").resolve()
 
 
 def test_load_settings_resolves_paths_relative_to_config(
@@ -374,49 +477,3 @@ def test_load_settings_rejects_legacy_path_keys(
 
     with pytest.raises(SettingsError, match="no longer supported"):
         load_settings(config_path, load_env=False)
-
-
-def test_configure_azure_output_creates_scoped_secret(tmp_path: Path) -> None:
-    class RecordingConnection:
-        statements: list[str] = []
-
-        def execute(self, sql: str) -> None:
-            self.statements.append(sql)
-
-    settings = Settings(
-        paths=PathSettings(
-            work_dir=tmp_path,
-            downloads_dir=tmp_path / "downloads",
-            extracted_dir=tmp_path / "extracted",
-            output_dir=tmp_path / "output",
-        ),
-        os_downloads=OSDownloadSettings(package_id="1", version_id="1"),
-        processing=ProcessingSettings(),
-        output_blob=OutputBlobSettings(uri="az://dnadatastore.blob.core.windows.net/outputs/ngd/"),
-        config_path=tmp_path / "config.yaml",
-    )
-    con = RecordingConnection()
-
-    configure_azure_output(con, settings)  # type: ignore[arg-type]
-
-    assert con.statements == [
-        "INSTALL azure",
-        "LOAD azure",
-        "CREATE OR REPLACE SECRET ukam_output (TYPE azure, PROVIDER credential_chain, "
-        "ACCOUNT_NAME 'dnadatastore', SCOPE 'az://dnadatastore.blob.core.windows.net/outputs/ngd/')",
-    ]
-
-
-@pytest.mark.parametrize(
-    "uri",
-    [
-        "az://outputs/ngd",  # no account host
-        "az://dnadatastore.blob.core.windows.net",  # no container
-        "abfss://dnadatastore.dfs.core.windows.net/outputs/ngd",
-        "s3://outputs/ngd",
-        "gs://outputs/ngd",
-    ],
-)
-def test_output_blob_rejects_unsupported_uri(uri: str) -> None:
-    with pytest.raises(ValidationError, match=r"az://<account>\.blob\.core\.windows\.net"):
-        OutputBlobSettings(uri=uri)

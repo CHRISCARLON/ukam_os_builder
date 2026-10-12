@@ -6,20 +6,102 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import yaml
 
 from ukam_os_builder.api.settings import (
     OSDownloadSettings,
-    OutputBlobSettings,
     PathSettings,
     ProcessingSettings,
     Settings,
     create_duckdb_connection,
 )
+from ukam_os_builder.data_sources.abp.transform.runner import transform_to_flatfile
 from ukam_os_builder.data_sources.ngd.to_flatfile import run_flatfile_step
 from ukam_os_builder.os_builder.extract import convert_csv_to_parquet
 
 # Path to sample data (real NGD data from a small area)
 SAMPLE_DATA_DIR = Path(__file__).parent / "data"
+
+
+def _prepare_abp_test_parquet(settings: Settings) -> tuple[int, int]:
+    settings.paths.parquet_dir = settings.paths.extracted_dir / "parquet"
+    directory = settings.paths.parquet_dir / "raw"
+    directory.mkdir(parents=True, exist_ok=True)
+    schema_path = (
+        Path(__file__).parents[1] / "ukam_os_builder/data_sources/abp/schemas/abp_schema.yaml"
+    )
+    schema = yaml.safe_load(schema_path.read_text())
+    tables = [
+        "blpu",
+        "lpi",
+        "street_descriptor",
+        "organisation",
+        "delivery_point",
+        "classification",
+    ]
+    with duckdb.connect() as con:
+        for table in tables:
+            columns = ", ".join(
+                f'"{name}" {column["type"]}' for name, column in schema[table]["columns"].items()
+            )
+            con.execute(f"CREATE TABLE {table} ({columns})")
+        parent = con.execute(
+            "SELECT MIN(range) FROM range(100, 200) WHERE hash(range) % 2 = 0"
+        ).fetchone()[0]
+        child = con.execute(
+            "SELECT MIN(range) FROM range(100, 200) WHERE hash(range) % 2 = 1"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO blpu (uprn, logical_status, parent_uprn, postcode_locator, country) VALUES (?, 1, NULL, 'SW1A 1AA', 'E'), (?, 1, ?, 'SW1A 1AA', 'E')",
+            [parent, child, parent],
+        )
+        con.execute(
+            "INSERT INTO street_descriptor (usrn, street_description, town_name, language) VALUES (1, 'TEST ROAD', 'LONDON', 'ENG')"
+        )
+        con.execute(
+            "INSERT INTO lpi (uprn, lpi_key, logical_status, language, usrn, pao_start_number) VALUES (?, 'parent', 1, 'ENG', 1, 1), (?, 'child', 1, 'ENG', 1, 2)",
+            [parent, child],
+        )
+        for table in tables:
+            con.execute(
+                f"COPY {table} TO '{(directory / (table + '.parquet')).as_posix()}' (FORMAT PARQUET)"
+            )
+    return parent, child
+
+
+def test_abp_chunks_preserve_rows_and_cross_chunk_parent(temp_settings: Settings) -> None:
+    parent, child = _prepare_abp_test_parquet(temp_settings)
+    baseline_files = transform_to_flatfile(temp_settings, force=True)
+    with duckdb.connect() as con:
+        baseline = (
+            con.read_parquet([str(path) for path in baseline_files])
+            .order("unique_id, address_concat")
+            .fetchall()
+        )
+        schema = con.read_parquet([str(path) for path in baseline_files]).columns
+    assert baseline
+    temp_settings.processing.num_chunks = 2
+    chunk_files = transform_to_flatfile(temp_settings, force=True)
+    assert len(chunk_files) == 2
+    assert all(isinstance(path, Path) for path in chunk_files)
+    with duckdb.connect() as con:
+        relation = con.read_parquet([str(path) for path in chunk_files])
+        assert relation.columns == schema
+        assert relation.order("unique_id, address_concat").fetchall() == baseline
+        assert (
+            relation.filter(f"unique_id = '{parent}'").project("hierarchy_level").fetchone()[0]
+            == "P"
+        )
+        assert relation.filter(f"unique_id = '{child}'").count("*").fetchone()[0] > 0
+    assert not list(temp_settings.paths.work_dir.glob("ukam_duckdb_*"))
+
+
+def test_flatfile_cleanup_belongs_to_destination() -> None:
+    from ukam_os_builder.pipeline import _ABP_PIPELINE, _NGD_PIPELINE
+
+    for definition in [_ABP_PIPELINE, _NGD_PIPELINE]:
+        assert "output_dir" not in definition.clean_patterns
+        assert definition.step_outputs["flatfile"] == []
 
 
 @pytest.fixture
@@ -279,19 +361,3 @@ def test_deduplication(temp_settings: Settings) -> None:
 
     assert len(result) == 0, f"Should have no duplicate UPRN+address: {result}"
     con.close()
-
-
-def test_flatfile_writes_to_output_blob(
-    temp_settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With output_blob set, output is written to the blob URI (a local folder stands in for now)."""
-    _prepare_test_parquet(temp_settings)
-    temp_settings.output_blob = OutputBlobSettings.model_construct(uri=tmp_path.as_posix())
-    monkeypatch.setattr(
-        "ukam_os_builder.data_sources.ngd.to_flatfile.configure_azure_output",
-        lambda *_: None,
-    )
-
-    outputs = run_flatfile_step(temp_settings, force=True)
-
-    assert outputs == [f"{tmp_path.as_posix()}/ngd_for_uk_address_matcher.chunk_001_of_001.parquet"]

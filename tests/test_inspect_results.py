@@ -4,6 +4,8 @@ from pathlib import Path
 from textwrap import dedent
 
 import duckdb
+import pytest
+import yaml
 
 from ukam_os_builder.os_builder.inspect_results import inspect_flatfile_variants
 
@@ -12,7 +14,15 @@ def _write_config(path: Path, content: str) -> None:
     path.write_text(dedent(content).strip() + "\n", encoding="utf-8")
 
 
-def test_inspect_flatfile_variants_uses_config_defaults(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"output_dir": "./out"},
+        {"overrides": {"output_dir": "./out"}},
+        {"work_dir": "s3://test-bucket/base", "overrides": {"output_dir": "./out"}},
+    ],
+)
+def test_inspect_flatfile_variants_uses_config_defaults(tmp_path: Path, paths: dict) -> None:
     output_dir = tmp_path / "out"
     output_dir.mkdir(parents=True)
     parquet_path = output_dir / "ngd_for_uk_address_matcher.chunk_001_of_001.parquet"
@@ -34,17 +44,27 @@ def test_inspect_flatfile_variants_uses_config_defaults(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     _write_config(
         config_path,
-        """
-        source:
-          type: ngd
-        paths:
-          output_dir: ./out
-        """,
+        yaml.safe_dump({"source": {"type": "ngd"}, "paths": paths}),
     )
 
     result = inspect_flatfile_variants(config_path=config_path, show=False)
     assert result["selected_uprn"] == 1001
     assert result["variant_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"work_dir": "s3://test-bucket/base"},
+        {"overrides": {"output_dir": "az://account.blob.core.windows.net/container/final"}},
+    ],
+)
+def test_inspection_rejects_cloud_output_explicitly(tmp_path: Path, paths: dict) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, yaml.safe_dump({"paths": paths}))
+
+    with pytest.raises(ValueError, match="Inspection supports local output only"):
+        inspect_flatfile_variants(config_path=config_path, show=False)
 
 
 def test_inspect_flatfile_variants_supports_abp_pattern(tmp_path: Path) -> None:
