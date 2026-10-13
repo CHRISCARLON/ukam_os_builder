@@ -9,6 +9,9 @@ from typing import Any, Literal
 
 from ukam_os_builder._exceptions import PipelineError
 
+PipelineStage = Literal["download", "extract", "split", "flatfile"]
+PipelineRunStep = Literal["all", "download", "extract", "split", "flatfile"]
+
 COMMON_BLOAT_PATTERNS: tuple[str, ...] = (
     "**/*consolidated*.parquet",
     "**/*cleansed*.parquet",
@@ -19,7 +22,7 @@ COMMON_BLOAT_PATTERNS: tuple[str, ...] = (
 class PipelineStep:
     """Callable step in a pipeline with a stable name."""
 
-    name: str
+    name: PipelineStage
     runner: Callable[[Any, bool, bool], None]
 
 
@@ -28,7 +31,7 @@ def make_download_step(runner: Callable[[Any, bool, bool], None]) -> PipelineSte
     return PipelineStep(name="download", runner=runner)
 
 
-def make_standard_step(name: str, runner: Callable[[Any, bool], None]) -> PipelineStep:
+def make_standard_step(name: PipelineStage, runner: Callable[[Any, bool], None]) -> PipelineStep:
     """Create a non-download step that ignores list-only mode."""
 
     def _wrapped(settings: Any, force: bool, _list_only: bool) -> None:
@@ -44,7 +47,7 @@ class PipelineDefinition:
     dataset_name: str
     steps: tuple[PipelineStep, ...]
     clean_patterns: dict[str, list[str]]
-    step_outputs: dict[str, list[str]]
+    step_outputs: dict[PipelineStage, list[str]]
 
 
 def _clean_directory(directory: Path, patterns: list[str], *, logger: logging.Logger) -> int:
@@ -64,7 +67,7 @@ def _clean_directory(directory: Path, patterns: list[str], *, logger: logging.Lo
 
 def _clean_outputs_for_step(
     *,
-    step: Literal["all", "download"],
+    step: PipelineStage,
     settings: Any,
     definition: PipelineDefinition,
     logger: logging.Logger,
@@ -101,23 +104,21 @@ def _clean_outputs_for_step(
 def run_pipeline(
     *,
     definition: PipelineDefinition,
-    step: Literal["all", "download"],
+    step: PipelineRunStep,
     settings: Any,
     force: bool = False,
     list_only: bool = False,
     logger: logging.Logger,
 ) -> None:
     """Run pipeline using shared control flow and dataset-specific step factories."""
-    valid_steps = {"all", "download"}
-    # Only allow users to leverage "download" and "all" steps for pipeline runs
-    # This simplifies the task of interacting with the pipeline and should encompass
-    # most common use cases (e.g. re-running the download step, or re-running the entire pipeline)
+    step_runners = {pipeline_step.name: pipeline_step.runner for pipeline_step in definition.steps}
+    valid_steps = {"all", *step_runners}
     if step not in valid_steps:
         raise PipelineError(
             f"Invalid step: {step}. Must be one of: {', '.join(sorted(valid_steps))}"
         )
-
-    step_runners = {pipeline_step.name: pipeline_step.runner for pipeline_step in definition.steps}
+    if list_only and step not in {"all", "download"}:
+        raise PipelineError("list_only can only be used with download or all")
     total_start = perf_counter()
 
     logger.info("=" * 60)

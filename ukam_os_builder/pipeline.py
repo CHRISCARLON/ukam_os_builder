@@ -14,6 +14,8 @@ from ukam_os_builder.os_builder.os_hub import run_download_step
 from ukam_os_builder.os_builder.pipeline_factory import (
     COMMON_BLOAT_PATTERNS,
     PipelineDefinition,
+    PipelineRunStep,
+    PipelineStage,
     make_download_step,
     make_standard_step,
     run_pipeline,
@@ -83,7 +85,7 @@ _PIPELINES_BY_SOURCE: dict[SourceType, PipelineDefinition] = {
 }
 
 
-def supported_steps_for_source(source: SourceType) -> set[str]:
+def supported_steps_for_source(source: SourceType) -> set[PipelineStage]:
     definition = _definition_for_source(source)
     return {pipeline_step.name for pipeline_step in definition.steps}
 
@@ -96,7 +98,7 @@ def _definition_for_source(source: SourceType) -> PipelineDefinition:
 
 
 def run(
-    step: Literal["all", "download"],
+    step: PipelineRunStep,
     settings: Settings,
     force: bool = False,
     list_only: bool = False,

@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-import tempfile
-from collections.abc import Generator
 from pathlib import Path
 
 import duckdb
 import pytest
 import yaml
 
-from ukam_os_builder.api.settings import (
-    OSDownloadSettings,
-    PathSettings,
-    ProcessingSettings,
-    Settings,
-    create_duckdb_connection,
-)
+from ukam_os_builder.api.settings import Settings, create_duckdb_connection
 from ukam_os_builder.data_sources.abp.transform.runner import transform_to_flatfile
 from ukam_os_builder.data_sources.ngd.to_flatfile import run_flatfile_step
 from ukam_os_builder.os_builder.extract import convert_csv_to_parquet
@@ -102,98 +94,6 @@ def test_flatfile_cleanup_belongs_to_destination() -> None:
     for definition in [_ABP_PIPELINE, _NGD_PIPELINE]:
         assert "output_dir" not in definition.clean_patterns
         assert definition.step_outputs["flatfile"] == []
-
-
-@pytest.fixture
-def temp_settings() -> Generator[Settings, None, None]:
-    """Create settings pointing to a temporary directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-
-        # Create directories
-        extracted_dir = tmpdir_path / "extracted"
-        parquet_dir = extracted_dir / "parquet"
-        output_dir = tmpdir_path / "output"
-
-        extracted_dir.mkdir()
-        parquet_dir.mkdir()
-        output_dir.mkdir()
-
-        paths = PathSettings(
-            work_dir=tmpdir_path,
-            downloads_dir=tmpdir_path / "downloads",
-            extracted_dir=extracted_dir,
-            output_dir=output_dir,
-        )
-
-        # Dummy OS download settings (not used in smoke test)
-        os_downloads = OSDownloadSettings(
-            package_id="test",
-            version_id="test",
-            api_key="test",
-            api_secret="test",
-        )
-
-        processing = ProcessingSettings(
-            parquet_compression="zstd",
-            parquet_compression_level=1,  # Faster for tests
-            num_chunks=1,
-            ngd_excluded_stems=[],
-        )
-
-        settings = Settings(
-            paths=paths,
-            os_downloads=os_downloads,
-            processing=processing,
-            config_path=tmpdir_path / "config.yaml",
-        )
-
-        yield settings
-
-
-@pytest.fixture
-def temp_settings_chunked() -> Generator[Settings, None, None]:
-    """Create settings with num_chunks=2 for chunking tests."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-
-        extracted_dir = tmpdir_path / "extracted"
-        parquet_dir = extracted_dir / "parquet"
-        output_dir = tmpdir_path / "output"
-
-        extracted_dir.mkdir()
-        parquet_dir.mkdir()
-        output_dir.mkdir()
-
-        paths = PathSettings(
-            work_dir=tmpdir_path,
-            downloads_dir=tmpdir_path / "downloads",
-            extracted_dir=extracted_dir,
-            output_dir=output_dir,
-        )
-
-        os_downloads = OSDownloadSettings(
-            package_id="test",
-            version_id="test",
-            api_key="test",
-            api_secret="test",
-        )
-
-        processing = ProcessingSettings(
-            parquet_compression="zstd",
-            parquet_compression_level=1,
-            num_chunks=2,
-            ngd_excluded_stems=[],
-        )
-
-        settings = Settings(
-            paths=paths,
-            os_downloads=os_downloads,
-            processing=processing,
-            config_path=tmpdir_path / "config.yaml",
-        )
-
-        yield settings
 
 
 def _prepare_test_parquet(settings: Settings) -> None:
