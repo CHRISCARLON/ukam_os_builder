@@ -138,7 +138,7 @@ For a local base, all directories are derived under `work_dir`. For an S3 or Azu
 
 ### Command notes
 
-- `step` only supports `download` and `all` to simplify usage. Use `--overwrite` to re-run a step with the same parameters.
+- `step` can run an individual stage or `all`. Available stages are source-specific: NGD supports `download`, `extract`, and `flatfile`; ABP also supports `split`. Use `--overwrite` to re-run a step with the same parameters.
 - CLI overrides take precedence over values in `config.yaml`.
 - By default, `ukam-os-build` loads `.env` from the same directory as your config, unless `--env-file` is supplied.
 
