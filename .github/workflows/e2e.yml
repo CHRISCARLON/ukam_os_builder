@@ -1,147 +1,160 @@
 name: End-to-end tests
 
 on:
-    pull_request:
-        branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "ukam_os_builder/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
 
 permissions:
-    contents: read
+  contents: read
 
 concurrency:
-    group: e2e-${{ github.head_ref || github.ref }}
-    cancel-in-progress: true
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-    e2e:
-        runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - source: ngd
-                      package_id: "18296"
-                      version_id: "118120"
-                    - source: abp
-                      package_id: "0040206240"
-                      version_id: "6777574"
+  e2e:
+    if: github.ref == 'refs/heads/main'
+    environment: os-e2e
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: ngd
+            package_id: "18296"
+            version_id: "118120"
+          - source: abp
+            package_id: "0040206240"
+            version_id: "6777574"
 
-        name: E2E – ${{ matrix.source }}
+    name: E2E - ${{ matrix.source }}
 
-        steps:
-            - uses: actions/checkout@v5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
-            - name: Mask API credentials
-              run: |
-                  echo "::add-mask::${{ secrets.OS_PROJECT_API_KEY }}"
-                  echo "::add-mask::${{ secrets.OS_PROJECT_API_SECRET }}"
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.10"
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.10"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v7
-              with:
-                  enable-cache: true
-                  cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --all-extras --all-groups --locked
 
-            - name: Install dependencies
-              run: uv sync --all-extras --all-groups
+      - name: Write config.yaml
+        env:
+          PIPELINE_SOURCE: ${{ matrix.source }}
+          OS_PACKAGE_ID: ${{ matrix.package_id }}
+          OS_VERSION_ID: ${{ matrix.version_id }}
+        run: |
+          umask 077
+          printf '%s\n' \
+            'paths:' \
+            '  work_dir: ./data' \
+            '' \
+            'source:' \
+            "  type: $PIPELINE_SOURCE" \
+            '' \
+            'os_downloads:' \
+            "  package_id: \"$OS_PACKAGE_ID\"" \
+            "  version_id: \"$OS_VERSION_ID\"" \
+            '' \
+            'processing:' \
+            '  parquet_compression: zstd' \
+            '  parquet_compression_level: 9' \
+            '  num_chunks: 1' \
+            > config.yaml
 
-            - name: Write config.yaml
-              run: |
-                  printf '%s\n' \
-                    'paths:'                                          \
-                    '  work_dir: ./data'                              \
-                    ''                                                \
-                    'source:'                                         \
-                    '  type: ${{ matrix.source }}'                    \
-                    ''                                                \
-                    'os_downloads:'                                   \
-                    '  package_id: "${{ matrix.package_id }}"'        \
-                    '  version_id: "${{ matrix.version_id }}"'        \
-                    ''                                                \
-                    'processing:'                                     \
-                    '  parquet_compression: zstd'                     \
-                    '  parquet_compression_level: 9'                  \
-                    '  num_chunks: 1'                                 \
-                    > config.yaml
+      - name: Run live pipeline
+        env:
+          OS_PROJECT_API_KEY: ${{ secrets.OS_PROJECT_API_KEY }}
+          OS_PROJECT_API_SECRET: ${{ secrets.OS_PROJECT_API_SECRET }}
+        run: |
+          set +x
+          if [[ -z "$OS_PROJECT_API_KEY" || -z "$OS_PROJECT_API_SECRET" ]]; then
+            echo "::error::Required OS API credentials are unavailable."
+            exit 1
+          fi
+          if ! uv run ukam-os-build >/dev/null 2>&1; then
+            echo "::error::Live pipeline failed; output was suppressed."
+            exit 1
+          fi
+          echo "Live pipeline completed."
 
-            - name: Run full pipeline
-              env:
-                  OS_PROJECT_API_KEY: ${{ secrets.OS_PROJECT_API_KEY }}
-                  OS_PROJECT_API_SECRET: ${{ secrets.OS_PROJECT_API_SECRET }}
-              run: uv run ukam-os-build --verbose
+      - name: Verify live output exists
+        shell: bash
+        run: |
+          output_file="$(find data/output -type f -name '*.parquet' -print -quit 2>/dev/null || true)"
+          if [[ -z "$output_file" ]]; then
+            echo "::error::Live pipeline produced no parquet output."
+            exit 1
+          fi
+          echo "Live pipeline produced parquet output."
 
-            - name: Verify output files exist
-              run: |
-                  echo "=== Output directory ==="
-                  ls -lhR data/output/
-                  echo ""
-                  echo "=== Checking for parquet files ==="
-                  count=$(find data/output -name '*.parquet' | wc -l)
-                  echo "Found $count parquet file(s) in data/output/"
-                  if [ "$count" -eq 0 ]; then
-                    echo "::error::No parquet output files found!"
-                    exit 1
-                  fi
+      - name: Record cached download checksums
+        shell: bash
+        run: |
+          download_file="$(find data/downloads -type f -print -quit 2>/dev/null || true)"
+          if [[ -z "$download_file" ]]; then
+            echo "::error::Live pipeline produced no cached downloads."
+            exit 1
+          fi
+          find data/downloads -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum > "$RUNNER_TEMP/e2e-downloads-before.sha256"
 
-            - name: Preview first output row
-              run: |
-                  uv run python -c "
-                  import duckdb
-                  con = duckdb.connect()
-                  con.sql(\"SELECT * FROM read_parquet('data/output/*.parquet')\").show(max_rows=1, max_width=10000)
-                  "
+      - name: Prepare for offline rerun
+        shell: bash
+        run: |
+          if [[ "$PWD" != "$GITHUB_WORKSPACE" || ! -d data/downloads ]]; then
+            echo "::error::Refusing to clear an unexpected working directory."
+            exit 1
+          fi
+          find data -mindepth 1 -maxdepth 1 ! -name downloads -exec rm -rf -- {} +
 
-            # ── Second run: offline (no API credentials) ──────────────
-            - name: Record download file timestamps
-              run: |
-                  stat -c '%n %Y' data/downloads/* | sort > /tmp/downloads_before.txt
-                  echo "=== Download file timestamps ==="
-                  cat /tmp/downloads_before.txt
+      - name: Run offline pipeline
+        shell: bash
+        run: |
+          if [[ -n "${OS_PROJECT_API_KEY:-}" || -n "${OS_PROJECT_API_SECRET:-}" ]]; then
+            echo "::error::API credentials are unexpectedly available during the offline run."
+            exit 1
+          fi
+          if ! uv run ukam-os-build --overwrite >/dev/null 2>&1; then
+            echo "::error::Offline pipeline failed; output was suppressed."
+            exit 1
+          fi
+          echo "Offline pipeline completed."
 
-            - name: Remove everything except downloads and block API access
-              run: |
-                  find data -mindepth 1 -maxdepth 1 ! -name downloads -exec rm -rf {} +
-                  echo "=== Remaining data tree ==="
-                  find data -type f | sort
+      - name: Verify offline output exists
+        shell: bash
+        run: |
+          output_file="$(find data/output -type f -name '*.parquet' -print -quit 2>/dev/null || true)"
+          if [[ -z "$output_file" ]]; then
+            echo "::error::Offline pipeline produced no parquet output."
+            exit 1
+          fi
+          echo "Offline pipeline produced parquet output."
 
-            - name: Re-run pipeline without API credentials
-              run: |
-                  unset OS_PROJECT_API_KEY OS_PROJECT_API_SECRET
-                  uv run ukam-os-build --verbose --overwrite
-
-            - name: Verify output files exist (offline run)
-              run: |
-                  echo "=== Output directory ==="
-                  ls -lhR data/output/
-                  echo ""
-                  echo "=== Checking for parquet files ==="
-                  count=$(find data/output -name '*.parquet' | wc -l)
-                  echo "Found $count parquet file(s) in data/output/"
-                  if [ "$count" -eq 0 ]; then
-                    echo "::error::No parquet output files found on offline run!"
-                    exit 1
-                  fi
-
-            - name: Preview first output row (offline run)
-              run: |
-                  uv run python -c "
-                  import duckdb
-                  con = duckdb.connect()
-                  con.sql(\"SELECT * FROM read_parquet('data/output/*.parquet')\").show(max_rows=1, max_width=10000)
-                  "
-
-            - name: Verify downloads were not modified
-              run: |
-                  stat -c '%n %Y' data/downloads/* | sort > /tmp/downloads_after.txt
-                  echo "=== Download file timestamps after offline run ==="
-                  cat /tmp/downloads_after.txt
-                  if ! diff -q /tmp/downloads_before.txt /tmp/downloads_after.txt; then
-                    echo "::error::Download file timestamps changed – files were unexpectedly modified!"
-                    diff /tmp/downloads_before.txt /tmp/downloads_after.txt
-                    exit 1
-                  fi
-                  echo "Download timestamps unchanged – existing archives were reused as expected."
+      - name: Verify cached downloads were unchanged
+        shell: bash
+        run: |
+          before="$RUNNER_TEMP/e2e-downloads-before.sha256"
+          after="$RUNNER_TEMP/e2e-downloads-after.sha256"
+          trap 'rm -f -- "$before" "$after"' EXIT
+          find data/downloads -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum > "$after"
+          if ! cmp -s "$before" "$after"; then
+            echo "::error::Offline run changed or removed cached downloads."
+            exit 1
+          fi
+          echo "Cached downloads were unchanged."
