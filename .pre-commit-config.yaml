@@ -3,12 +3,13 @@ repos:
     hooks:
       - id: detect-secrets
         name: Scan staged text files for secrets
-        entry: uv run --no-sync detect-secrets-hook --baseline .secrets.baseline
+        entry: uv run --no-sync detect-secrets-hook --baseline security/secrets.baseline
         language: system
+        exclude: ^security/secrets\.baseline$
         types: [text]
       - id: bandit
         name: Scan staged application code with Bandit
-        entry: uv run --no-sync bandit -q --confidence-level medium --baseline .bandit.baseline
+        entry: uv run --no-sync bandit -q --confidence-level medium --baseline security/bandit.baseline
         language: system
         files: ^ukam_os_builder/
         types: [python]
