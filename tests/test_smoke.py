@@ -130,8 +130,8 @@ def temp_settings() -> Generator[Settings, None, None]:
         os_downloads = OSDownloadSettings(
             package_id="test",
             version_id="test",
-            api_key="test",
-            api_secret="test",
+            api_key="test",  # pragma: allowlist secret
+            api_secret="test",  # pragma: allowlist secret
         )
 
         processing = ProcessingSettings(
@@ -175,8 +175,8 @@ def temp_settings_chunked() -> Generator[Settings, None, None]:
         os_downloads = OSDownloadSettings(
             package_id="test",
             version_id="test",
-            api_key="test",
-            api_secret="test",
+            api_key="test",  # pragma: allowlist secret
+            api_secret="test",  # pragma: allowlist secret
         )
 
         processing = ProcessingSettings(
