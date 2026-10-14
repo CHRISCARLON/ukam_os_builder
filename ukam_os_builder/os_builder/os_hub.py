@@ -170,7 +170,7 @@ def print_download_summary(metadata: dict, items: list[DownloadItem], api_key: s
 
 def _calculate_md5(file_path: Path) -> str:
     """Calculate MD5 hash of a file."""
-    md5_hash = hashlib.md5()
+    md5_hash = hashlib.md5(usedforsecurity=False)
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             md5_hash.update(chunk)
@@ -219,7 +219,7 @@ def download_file(
         downloaded = 0
         next_log = 10 * 1024 * 1024
 
-        md5_hash = hashlib.md5() if expected_md5 else None
+        md5_hash = hashlib.md5(usedforsecurity=False) if expected_md5 else None
         with open(part_path, "wb", buffering=chunk_size) as f:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
