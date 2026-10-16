@@ -28,25 +28,6 @@ problem you want to solve. Do not include private or licence-restricted address
 data, confidential results or credentials. Report suspected vulnerabilities
 privately to the maintainers, rather than in a public issue.
 
-## Contributing to documentation
-
-Documentation contributions are welcome, including typo fixes, clearer examples
-and accessibility improvements. For a small correction, please open a small PR
-with the proposed change rather than only describing the edit in an issue.
-You can edit the relevant file on GitHub or work in a fork locally.
-
-Keep documentation concise and within the scope of your contribution. A brief
-acknowledgement of a minor behaviour change can be useful; it does not normally
-need a new guide or extensive explanation. We aim to keep the documentation
-lightweight and focused on what users need.
-
-Do not make sweeping documentation rewrites or reorganise unrelated pages as part
-of a feature PR. Discuss substantial changes with the team before starting.
-Take particular care with automated AI edits: review the full diff and remove
-changes beyond the agreed scope. A small feature should not cause unrelated
-documentation to be rewritten around that feature or imply that it is the default
-approach throughout the project.
-
 ## Contributing code
 
 ### Before starting work
